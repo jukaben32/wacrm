@@ -20,29 +20,46 @@ interface OpenAiResponse {
 }
 
 /**
- * Call OpenAI's Chat Completions endpoint with the caller's own key.
+ * Call OpenAI / OpenRouter's Chat Completions endpoint with the caller's key.
+ * Automatically routes to OpenRouter when an OpenRouter API key (`sk-or-...`)
+ * or a namespaced model (`provider/model`) is provided.
  * Returns the raw assistant text + token usage (handoff parsing happens
  * in `generateReply`).
  */
 export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult> {
   const { apiKey, model, systemPrompt, messages, timeoutMs } = args
+  const isOpenRouter = apiKey.startsWith('sk-or-') || model.includes('/')
+  const endpoint = isOpenRouter
+    ? 'https://openrouter.ai/api/v1/chat/completions'
+    : OPENAI_URL
 
   let res: Response
   try {
-    res = await fetch(OPENAI_URL, {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    }
+    if (isOpenRouter) {
+      headers['HTTP-Referer'] = 'https://wacrm.local'
+      headers['X-Title'] = 'WACRM'
+    }
+
+    const payload: Record<string, unknown> = {
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...mergeConsecutive(messages),
+      ],
+      max_tokens: MAX_OUTPUT_TOKENS,
+    }
+    if (!isOpenRouter) {
+      payload.max_completion_tokens = MAX_OUTPUT_TOKENS
+    }
+
+    res = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...mergeConsecutive(messages),
-        ],
-        max_completion_tokens: MAX_OUTPUT_TOKENS,
-      }),
+      headers,
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (err) {
@@ -50,15 +67,18 @@ export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult
   }
 
   if (!res.ok) {
-    throw await providerHttpError('OpenAI', res)
+    throw await providerHttpError(isOpenRouter ? 'OpenRouter' : 'OpenAI', res)
   }
 
   const data = (await res.json().catch(() => null)) as OpenAiResponse | null
   const text = data?.choices?.[0]?.message?.content
   if (!text || typeof text !== 'string' || !text.trim()) {
-    throw new AiError('OpenAI returned an empty response.', {
-      code: 'empty_response',
-    })
+    throw new AiError(
+      `${isOpenRouter ? 'OpenRouter' : 'OpenAI'} returned an empty response.`,
+      {
+        code: 'empty_response',
+      },
+    )
   }
   const usage = normalizeUsage({
     prompt: data?.usage?.prompt_tokens,
